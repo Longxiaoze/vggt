@@ -34,10 +34,11 @@ def load_model(device=None):
     model = model.to(device)
     return model, device
 
-def process_images(image_dir, model, device):
+def process_images(image_dir, model, device,downsample_factor=1):
     """Process images with VGGT and return predictions."""
     image_names = glob.glob(os.path.join(image_dir, "*"))
     image_names = sorted([f for f in image_names if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    image_names  = image_names[::downsample_factor]  # Downsample images if needed
     print(f"Found {len(image_names)} images")
     
     if len(image_names) == 0:
@@ -342,7 +343,7 @@ def filter_and_prepare_points(predictions, conf_threshold, mask_sky=False, mask_
                 if not np.all(np.isfinite(point3D)):
                     continue
                 
-                point_hash = hash_point(point3D, scale=100)
+                point_hash = hash_point(point3D, scale=1000)
                 
                 if point_hash not in point_indices:
                     point_idx = len(points3D)
@@ -471,7 +472,8 @@ def write_colmap_images_bin(file_path, quaternions, translations, image_points2D
             qw, qx, qy, qz = quaternions[i].astype(float)
             tx, ty, tz = translations[i].astype(float)
             
-            image_name = os.path.basename(image_names[i]).encode()
+            # image_name = os.path.basename(image_names[i]).encode()
+            image_name = image_names[i].encode()
             points = image_points2D[i]
             
             # Image ID (uint32)
@@ -522,13 +524,117 @@ def write_colmap_points3D_bin(file_path, points3D):
             for img_id, point2d_idx in track:
                 fid.write(struct.pack('<II', img_id + 1, point2d_idx))
 
+def filter_and_remap_colmap_model(bin_dir, output_dir, min_track_length=2):
+    """
+    从 bin_dir 读取 cameras.bin, images.bin, points3D.bin，
+    1) 过滤掉 track length < min_track_length 的 3D 点
+    2) 重映射剩余点的 POINT3D_ID 为连续索引 [1..N]
+    3) 更新 images.bin 中所有 POINT3D_ID 的引用
+    4) 将新的 cameras.bin, images.bin, points3D.bin 写入 output_dir
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    in_pts_path    = os.path.join(bin_dir, "points3D.bin")
+    in_img_path    = os.path.join(bin_dir, "images.bin")
+    in_cam_path    = os.path.join(bin_dir, "cameras.bin")
+    out_pts_path   = os.path.join(output_dir, "points3D.bin")
+    out_img_path   = os.path.join(output_dir, "images.bin")
+    out_cam_path   = os.path.join(output_dir, "cameras.bin")
+
+    # --- 1. 读取并过滤 points3D.bin ---
+    kept_points = []   # list of tuples: (old_id, x,y,z, r,g,b, err, track_list)
+    with open(in_pts_path, 'rb') as f:
+        num_pts = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(num_pts):
+            old_id = struct.unpack('<Q', f.read(8))[0]
+            x, y, z = struct.unpack('<ddd', f.read(24))
+            r, g, b = struct.unpack('<BBB', f.read(3))
+            err      = struct.unpack('<d', f.read(8))[0]
+            tlen     = struct.unpack('<Q', f.read(8))[0]
+            track    = [struct.unpack('<II', f.read(8)) for __ in range(tlen)]
+            if tlen >= min_track_length:
+                kept_points.append((old_id, (x,y,z), (r,g,b), err, track))
+
+    # 建立 old_id -> new_id 的映射（COLMAP 从 1 开始编号）
+    old2new = {old: idx+1 for idx, (old, *_ ) in enumerate(kept_points)}
+
+    # --- 2. 重新写入 points3D.bin（新 ID, 连续） ---
+    with open(out_pts_path, 'wb') as f_out:
+        f_out.write(struct.pack('<Q', len(kept_points)))
+        for new_idx, (old_id, (x,y,z), (r,g,b), err, track) in enumerate(kept_points, start=1):
+            f_out.write(struct.pack('<Q', new_idx))            # 新 POINT3D_ID
+            f_out.write(struct.pack('<ddd', x, y, z))
+            f_out.write(struct.pack('<BBB', r, g, b))
+            f_out.write(struct.pack('<d', err))
+            # 过滤并重写 track entries 中已经被剔除的点引用
+            new_track = [(img_id, p2d_idx) for (img_id, p2d_idx) in track]
+            f_out.write(struct.pack('<Q', len(new_track)))
+            for img_id, p2d_idx in new_track:
+                f_out.write(struct.pack('<II', img_id, p2d_idx))
+
+    # --- 3. 读取并更新 images.bin ---
+    images = []
+    with open(in_img_path, 'rb') as f:
+        num_imgs = struct.unpack('<Q', f.read(8))[0]
+        for _ in range(num_imgs):
+            img_id = struct.unpack('<I', f.read(4))[0]
+            qw, qx, qy, qz = struct.unpack('<dddd', f.read(32))
+            tx, ty, tz    = struct.unpack('<ddd', f.read(24))
+            cam_id        = struct.unpack('<I', f.read(4))[0]
+
+            # 读取 image name (C-string)
+            name_bytes = bytearray()
+            while True:
+                c = f.read(1)
+                if c == b'\x00': break
+                name_bytes.extend(c)
+            name = name_bytes.decode()
+
+            # 读取 2D point 数量及每个点
+            num_pts2d = struct.unpack('<Q', f.read(8))[0]
+            pts2d = []
+            for __ in range(num_pts2d):
+                x, y       = struct.unpack('<dd', f.read(16))
+                old_pt3d_id= struct.unpack('<Q', f.read(8))[0]
+                # 只有当该 3D 点被保留时，才更新引用
+                if old_pt3d_id in old2new:
+                    pts2d.append((x, y, old2new[old_pt3d_id]))
+            images.append((img_id, (qw,qx,qy,qz), (tx,ty,tz), cam_id, name, pts2d))
+
+    # --- 4. 将 cameras.bin 直接拷贝到 output_dir ---
+    # 相机内参无需更改
+    import shutil
+    shutil.copy(in_cam_path, out_cam_path)
+
+    # --- 5. 写入新的 images.bin ---
+    with open(out_img_path, 'wb') as f_out:
+        f_out.write(struct.pack('<Q', len(images)))
+        for (img_id, quat, trans, cam_id, name, pts2d) in images:
+            qw, qx, qy, qz = quat
+            tx, ty, tz    = trans
+            f_out.write(struct.pack('<I', img_id))
+            f_out.write(struct.pack('<dddd', qw, qx, qy, qz))
+            f_out.write(struct.pack('<ddd', tx, ty, tz))
+            f_out.write(struct.pack('<I', cam_id))
+            # 写 name + null-terminator
+            f_out.write(name.encode() + b'\x00')
+            # 写 2D 点
+            f_out.write(struct.pack('<Q', len(pts2d)))
+            for x, y, new_pt3d_id in pts2d:
+                f_out.write(struct.pack('<dd', x, y))
+                f_out.write(struct.pack('<Q', new_pt3d_id))
+
+    print(f"Filtered & remapped model → '{output_dir}'：")
+    print(f"  points3D.bin: {len(kept_points)} points")
+    print(f"  images.bin:   {len(images)} images (with updated tracks)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert images to COLMAP format using VGGT")
     parser.add_argument("--image_dir", type=str, required=True, 
                         help="Directory containing input images")
     parser.add_argument("--output_dir", type=str, default="colmap_output", 
                         help="Directory to save COLMAP files")
-    parser.add_argument("--conf_threshold", type=float, default=50.0, 
+    parser.add_argument("--conf_threshold", type=float, default=40.0, 
                         help="Confidence threshold (0-100%) for including points")
     parser.add_argument("--mask_sky", action="store_true",
                         help="Filter out points likely to be sky")
@@ -543,14 +649,15 @@ def main():
     parser.add_argument("--prediction_mode", type=str, default="Depthmap and Camera Branch",
                         choices=["Depthmap and Camera Branch", "Pointmap Branch"],
                         help="Which prediction branch to use")
-    
+    parser.add_argument("--downsample", type=int, default=5,
+                        help="dowmsample factor for images") 
     args = parser.parse_args()
     
     os.makedirs(args.output_dir, exist_ok=True)
     
     model, device = load_model()
     
-    predictions, image_names = process_images(args.image_dir, model, device)
+    predictions, image_names = process_images(args.image_dir, model, device,args.downsample)
     
     print("Converting camera parameters to COLMAP format...")
     quaternions, translations = extrinsic_to_colmap_format(predictions["extrinsic"])
@@ -579,6 +686,9 @@ def main():
         write_colmap_points3D_bin(
             os.path.join(args.output_dir, "points3D.bin"), 
             points3D)
+        remap_dir = os.path.join(args.output_dir, "remap_colmap")
+        os.makedirs(remap_dir, exist_ok=True)
+        filter_and_remap_colmap_model(args.output_dir, remap_dir, min_track_length=2)
     else:
         write_colmap_cameras_txt(
             os.path.join(args.output_dir, "cameras.txt"), 
