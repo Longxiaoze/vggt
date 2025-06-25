@@ -31,18 +31,24 @@ def unproject_depth_map_to_point_map(
         intrinsics_cam = intrinsics_cam.cpu().numpy()
 
     world_points_list = []
+    cam_coords_points = []
     for frame_idx in range(depth_map.shape[0]):
-        cur_world_points, _, _ = depth_to_world_coords_points(
+        cur_world_points,cam_coords_point , _ = depth_to_world_coords_points(
             depth_map[frame_idx].squeeze(-1), extrinsics_cam[frame_idx], intrinsics_cam[frame_idx]
         )
         world_points_list.append(cur_world_points)
+        cam_coords_points.append(cam_coords_point)
     world_points_array = np.stack(world_points_list, axis=0)
+    cam_coords_points = np.stack(cam_coords_points, axis=0)
 
-    return world_points_array
+    return world_points_array,cam_coords_points
 
 
 def depth_to_world_coords_points(
-    depth_map: np.ndarray, extrinsic: np.ndarray, intrinsic: np.ndarray, eps=1e-8
+    depth_map: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    eps=1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert a depth map to world coordinates.
